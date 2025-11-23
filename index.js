@@ -1,30 +1,34 @@
 /**
- * TALABAT TOKEN HARVESTER - PRODUCTION GRADE
+ * TALABAT TOKEN HARVESTER - COOKIE-BASED SESSION
  * 
- * This script automates:
- * 1. Portal login/logout cycle
- * 2. Network traffic interception to capture JWT token
- * 3. Google Sheets synchronization
+ * This version uses SAVED COOKIES instead of manual login credentials.
  * 
- * Architecture: Puppeteer + Google Sheets API
+ * TWO MODES:
+ * 1. SETUP MODE: Run once to capture and save cookies from existing browser session
+ * 2. AUTO MODE: Uses saved cookies for automatic token harvesting (runs hourly)
+ * 
+ * Architecture: Puppeteer + Google Sheets API + Cookie Persistence
  * Execution: GitHub Actions (Hourly Cron)
  * Cost: $0 (Free Tier)
  */
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
+const fs = require('fs').promises;
+const path = require('path');
 
 // ==================== CONFIGURATION ====================
 const CONFIG = {
   portal: {
     url: 'https://portal.talabat.com/ae/',
-    tokenEndpoint: 'https://portal.talabat.com/v5/token',
-    email: process.env.PORTAL_EMAIL,
-    password: process.env.PORTAL_PASSWORD
+    tokenEndpoint: 'https://portal.talabat.com/v5/token'
   },
   sheet: {
     id: process.env.SHEET_ID,
     range: 'Sheet1!A1:B1' // A1 for token, B1 for timestamp
+  },
+  cookies: {
+    filePath: './session-cookies.json'
   },
   retry: {
     maxAttempts: 3,
@@ -32,15 +36,16 @@ const CONFIG = {
   },
   timeouts: {
     navigation: 60000,
-    networkIdle: 10000
+    networkIdle: 10000,
+    tokenWait: 15000
   }
 };
 
+// Determine if we're in setup mode (for one-time cookie capture)
+const SETUP_MODE = process.env.SETUP_MODE === 'true';
+
 // ==================== UTILITY FUNCTIONS ====================
 
-/**
- * Sleep utility for delays
- */
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
@@ -88,6 +93,101 @@ function validateToken(token) {
   return true;
 }
 
+// ==================== COOKIE MANAGEMENT ====================
+
+/**
+ * Save cookies to file
+ */
+async function saveCookies(page) {
+  try {
+    const cookies = await page.cookies();
+    const cookieJson = JSON.stringify(cookies, null, 2);
+    await fs.writeFile(CONFIG.cookies.filePath, cookieJson);
+    console.log(`[Cookies] Saved ${cookies.length} cookies to ${CONFIG.cookies.filePath}`);
+    return true;
+  } catch (error) {
+    console.error('[Cookies] Failed to save:', error.message);
+    return false;
+  }
+}
+
+/**
+ * Load cookies from file
+ */
+async function loadCookies(page) {
+  try {
+    // Check if cookie file exists
+    try {
+      await fs.access(CONFIG.cookies.filePath);
+    } catch {
+      console.warn('[Cookies] Cookie file not found, will need fresh login');
+      return false;
+    }
+    
+    const cookieJson = await fs.readFile(CONFIG.cookies.filePath, 'utf8');
+    const cookies = JSON.parse(cookieJson);
+    
+    if (!cookies || cookies.length === 0) {
+      console.warn('[Cookies] No cookies found in file');
+      return false;
+    }
+    
+    // Filter out expired cookies
+    const now = Date.now() / 1000;
+    const validCookies = cookies.filter(cookie => {
+      if (cookie.expires && cookie.expires < now) {
+        console.log(`[Cookies] Skipping expired cookie: ${cookie.name}`);
+        return false;
+      }
+      return true;
+    });
+    
+    if (validCookies.length === 0) {
+      console.warn('[Cookies] All cookies are expired');
+      return false;
+    }
+    
+    await page.setCookie(...validCookies);
+    console.log(`[Cookies] Loaded ${validCookies.length} valid cookies`);
+    return true;
+    
+  } catch (error) {
+    console.error('[Cookies] Failed to load:', error.message);
+    return false;
+  }
+}
+
+/**
+ * Check if cookies are still valid by testing navigation
+ */
+async function verifyCookiesValid(page) {
+  try {
+    await page.goto(CONFIG.portal.url, {
+      waitUntil: 'networkidle2',
+      timeout: CONFIG.timeouts.navigation
+    });
+    
+    await sleep(2000);
+    
+    // Check if we're on a login page or already logged in
+    const isLoggedIn = await page.evaluate(() => {
+      // Check for common logged-in indicators
+      const hasLogoutButton = document.querySelector('[data-testid*="logout"], [class*="logout"], button[aria-label*="logout"], a[href*="logout"]');
+      const hasUserMenu = document.querySelector('[data-testid*="user"], [class*="user-menu"], [class*="profile"]');
+      const isLoginPage = document.querySelector('input[type="password"]');
+      
+      return !!(hasLogoutButton || hasUserMenu) && !isLoginPage;
+    });
+    
+    console.log('[Cookies] Verification result - logged in:', isLoggedIn);
+    return isLoggedIn;
+    
+  } catch (error) {
+    console.error('[Cookies] Verification failed:', error.message);
+    return false;
+  }
+}
+
 // ==================== PUPPETEER AUTOMATION ====================
 
 /**
@@ -97,7 +197,7 @@ async function initBrowser() {
   console.log('[Browser] Launching Puppeteer...');
   
   const browser = await puppeteer.launch({
-    headless: 'new', // Use new headless mode
+    headless: SETUP_MODE ? false : 'new', // Show browser in setup mode
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -117,23 +217,79 @@ async function initBrowser() {
 }
 
 /**
- * Main token capture logic
+ * SETUP MODE: Manual login to capture cookies
  */
-async function captureToken(browser) {
+async function setupCookies(browser) {
+  console.log('\n========================================');
+  console.log('SETUP MODE: MANUAL LOGIN REQUIRED');
+  console.log('========================================');
+  console.log('1. Browser will open automatically');
+  console.log('2. Please LOG IN manually to the portal');
+  console.log('3. Wait for 10 seconds after successful login');
+  console.log('4. Cookies will be saved automatically');
+  console.log('========================================\n');
+  
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1920, height: 1080 });
+  
+  try {
+    // Navigate to portal
+    console.log('[Setup] Opening portal...');
+    await page.goto(CONFIG.portal.url, {
+      waitUntil: 'networkidle2',
+      timeout: CONFIG.timeouts.navigation
+    });
+    
+    console.log('[Setup] Portal loaded');
+    console.log('[Setup] Please log in manually now...');
+    console.log('[Setup] Waiting for 60 seconds for you to complete login...');
+    
+    // Wait for user to login manually
+    await sleep(60000);
+    
+    // Check if logged in
+    const isLoggedIn = await page.evaluate(() => {
+      const hasLogoutButton = document.querySelector('[data-testid*="logout"], [class*="logout"], button[aria-label*="logout"], a[href*="logout"]');
+      const hasUserMenu = document.querySelector('[data-testid*="user"], [class*="user-menu"], [class*="profile"]');
+      return !!(hasLogoutButton || hasUserMenu);
+    });
+    
+    if (!isLoggedIn) {
+      throw new Error('Login not detected. Please ensure you logged in successfully.');
+    }
+    
+    console.log('[Setup] ✅ Login detected!');
+    
+    // Save cookies
+    await saveCookies(page);
+    
+    console.log('\n========================================');
+    console.log('✅ SETUP COMPLETE!');
+    console.log('Cookies saved successfully');
+    console.log('You can now run in AUTO mode');
+    console.log('========================================\n');
+    
+  } finally {
+    await page.close();
+  }
+}
+
+/**
+ * Main token capture logic with cookie-based session
+ */
+async function captureTokenWithCookies(browser) {
   const page = await browser.newPage();
   
-  // Set realistic viewport and user agent
   await page.setViewport({ width: 1920, height: 1080 });
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   
   let capturedToken = null;
   
-  // Setup network interception BEFORE navigation
+  // Setup network interception
   console.log('[Network] Setting up response listener...');
   page.on('response', async (response) => {
     const url = response.url();
     
-    // Check if this is the token endpoint
     if (url.includes('/v5/token')) {
       console.log('[Network] Token endpoint detected!');
       console.log('[Network] URL:', url);
@@ -148,8 +304,6 @@ async function captureToken(browser) {
             capturedToken = data.access_token;
             console.log('[Network] ✅ Token captured successfully');
             console.log('[Network] Token preview:', capturedToken.substring(0, 50) + '...');
-          } else {
-            console.warn('[Network] Response does not contain access_token:', JSON.stringify(data));
           }
         }
       } catch (error) {
@@ -159,7 +313,15 @@ async function captureToken(browser) {
   });
   
   try {
-    // Step 1: Navigate to portal
+    // Step 1: Load saved cookies
+    console.log('[Session] Loading saved cookies...');
+    const cookiesLoaded = await loadCookies(page);
+    
+    if (!cookiesLoaded) {
+      throw new Error('Failed to load cookies. Please run SETUP MODE first.');
+    }
+    
+    // Step 2: Navigate to portal
     console.log('[Portal] Navigating to:', CONFIG.portal.url);
     await page.goto(CONFIG.portal.url, {
       waitUntil: 'networkidle2',
@@ -167,35 +329,21 @@ async function captureToken(browser) {
     });
     
     console.log('[Portal] Page loaded, current URL:', page.url());
-    
-    // Step 2: Wait for page to stabilize
     await sleep(3000);
     
-    // Step 3: Check if already logged in
-    const isLoggedIn = await page.evaluate(() => {
-      // Check for common logged-in indicators
-      const hasLogoutButton = document.querySelector('[data-testid*="logout"], [class*="logout"], button[aria-label*="logout"], a[href*="logout"]');
-      const hasUserMenu = document.querySelector('[data-testid*="user"], [class*="user-menu"], [class*="profile"]');
-      return !!(hasLogoutButton || hasUserMenu);
-    });
+    // Step 3: Verify we're logged in
+    const isLoggedIn = await verifyCookiesValid(page);
     
-    console.log('[Portal] Already logged in:', isLoggedIn);
-    
-    // Step 4: Perform logout if logged in
-    if (isLoggedIn) {
-      console.log('[Auth] Attempting logout...');
+    if (!isLoggedIn) {
+      console.warn('[Session] Cookies appear invalid, attempting logout-login cycle...');
       
-      // Try multiple logout strategies
-      const logoutSuccess = await page.evaluate(() => {
+      // Try to find and click logout
+      const logoutClicked = await page.evaluate(() => {
         const selectors = [
           '[data-testid*="logout"]',
           '[class*="logout"]',
           'button[aria-label*="logout"]',
-          'a[href*="logout"]',
-          'button:has-text("Logout")',
-          'button:has-text("Log out")',
-          'a:has-text("Logout")',
-          'a:has-text("Log out")'
+          'a[href*="logout"]'
         ];
         
         for (const selector of selectors) {
@@ -208,45 +356,75 @@ async function captureToken(browser) {
         return false;
       });
       
-      if (logoutSuccess) {
-        console.log('[Auth] Logout clicked, waiting for redirect...');
-        await sleep(3000);
-      } else {
-        console.warn('[Auth] Logout button not found, proceeding with login attempt');
+      if (logoutClicked) {
+        console.log('[Session] Logout triggered, waiting...');
+        await sleep(5000);
+        
+        // Cookies expired - need to re-run setup
+        throw new Error('Session expired. Please run SETUP MODE again to refresh cookies.');
       }
     }
     
-    // Step 5: Perform login
-    console.log('[Auth] Attempting login...');
+    // Step 4: Trigger logout-login to generate fresh token
+    console.log('[Auth] Performing logout-login cycle to refresh token...');
     
-    // Wait for login form
-    await page.waitForSelector('input[type="email"], input[name*="email"], input[id*="email"]', {
-      timeout: 30000
+    // Click logout
+    const logoutSuccess = await page.evaluate(() => {
+      const selectors = [
+        '[data-testid*="logout"]',
+        '[class*="logout"]',
+        'button[aria-label*="logout"]',
+        'a[href*="logout"]'
+      ];
+      
+      for (const selector of selectors) {
+        const element = document.querySelector(selector);
+        if (element) {
+          element.click();
+          return true;
+        }
+      }
+      return false;
     });
     
-    console.log('[Auth] Login form detected');
+    if (logoutSuccess) {
+      console.log('[Auth] Logout clicked, waiting for page...');
+      await sleep(5000);
+      
+      // Now the browser should show login form with saved credentials
+      // Click on login form fields to trigger auto-fill
+      console.log('[Auth] Triggering auto-fill...');
+      
+      try {
+        // Click email field to trigger autofill
+        await page.waitForSelector('input[type="email"], input[name*="email"], input[id*="email"]', {
+          timeout: 10000
+        });
+        
+        await page.click('input[type="email"], input[name*="email"], input[id*="email"]');
+        await sleep(1000);
+        
+        // Browser should auto-fill credentials now
+        console.log('[Auth] Credentials should be auto-filled by browser');
+        
+        // Submit the form
+        await Promise.all([
+          page.click('button[type="submit"], button[class*="submit"], button[class*="login"]'),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.timeouts.navigation })
+        ]);
+        
+        console.log('[Auth] ✅ Login submitted');
+        
+      } catch (error) {
+        console.error('[Auth] Auto-fill login failed:', error.message);
+        throw new Error('Auto-fill login failed. Browser may not have saved credentials.');
+      }
+    }
     
-    // Fill credentials
-    await page.type('input[type="email"], input[name*="email"], input[id*="email"]', CONFIG.portal.email, { delay: 100 });
-    console.log('[Auth] Email entered');
+    // Step 5: Wait for token to be captured
+    console.log('[Network] Waiting for token...');
     
-    await page.type('input[type="password"], input[name*="password"], input[id*="password"]', CONFIG.portal.password, { delay: 100 });
-    console.log('[Auth] Password entered');
-    
-    // Submit form
-    await Promise.all([
-      page.click('button[type="submit"], button[class*="submit"], button[class*="login"]'),
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.timeouts.navigation })
-    ]);
-    
-    console.log('[Auth] ✅ Login successful');
-    console.log('[Auth] Current URL:', page.url());
-    
-    // Step 6: Wait for token request (it should have been captured by now)
-    console.log('[Network] Waiting for token to be captured...');
-    
-    // Wait up to 10 seconds for token to appear
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 30; i++) {
       if (capturedToken) break;
       await sleep(500);
     }
@@ -254,6 +432,10 @@ async function captureToken(browser) {
     if (!capturedToken) {
       throw new Error('Token was not captured from network traffic');
     }
+    
+    // Step 6: Update cookies for next run
+    console.log('[Session] Updating saved cookies...');
+    await saveCookies(page);
     
     // Validate token
     validateToken(capturedToken);
@@ -267,9 +449,6 @@ async function captureToken(browser) {
 
 // ==================== GOOGLE SHEETS INTEGRATION ====================
 
-/**
- * Authenticate with Google Sheets API
- */
 function getGoogleAuth() {
   console.log('[Google] Authenticating with service account...');
   
@@ -284,9 +463,6 @@ function getGoogleAuth() {
   return auth;
 }
 
-/**
- * Update Google Sheet with token
- */
 async function updateSheet(token) {
   console.log('[Sheet] Updating Google Sheet...');
   
@@ -316,54 +492,55 @@ async function updateSheet(token) {
 async function main() {
   const startTime = Date.now();
   console.log('========================================');
-  console.log('TALABAT TOKEN HARVESTER - STARTING');
+  console.log('TALABAT TOKEN HARVESTER');
+  console.log('Mode:', SETUP_MODE ? 'SETUP (Manual Login)' : 'AUTO (Cookie-based)');
   console.log('Timestamp:', new Date().toISOString());
   console.log('========================================\n');
   
   let browser;
   
   try {
-    // Validate environment variables
-    if (!CONFIG.portal.email || !CONFIG.portal.password) {
-      throw new Error('Missing PORTAL_EMAIL or PORTAL_PASSWORD environment variables');
+    // Initialize browser
+    browser = await retryOperation(() => initBrowser(), 'Browser Init');
+    
+    if (SETUP_MODE) {
+      // Setup mode: Manual login to capture cookies
+      await setupCookies(browser);
+      
+    } else {
+      // Auto mode: Use saved cookies
+      
+      // Validate environment variables
+      if (!process.env.GOOGLE_SERVICE_ACCOUNT) {
+        throw new Error('Missing GOOGLE_SERVICE_ACCOUNT environment variable');
+      }
+      
+      if (!CONFIG.sheet.id) {
+        throw new Error('Missing SHEET_ID environment variable');
+      }
+      
+      // Capture token with retry logic
+      const token = await retryOperation(
+        () => captureTokenWithCookies(browser),
+        'Token Capture'
+      );
+      
+      console.log('\n[Success] Token harvested successfully!');
+      console.log('[Success] Token length:', token.length, 'characters');
+      
+      // Update Google Sheet
+      await retryOperation(
+        () => updateSheet(token),
+        'Sheet Update'
+      );
+      
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      
+      console.log('\n========================================');
+      console.log('✅ EXECUTION COMPLETED SUCCESSFULLY');
+      console.log('Duration:', duration, 'seconds');
+      console.log('========================================');
     }
-    
-    if (!process.env.GOOGLE_SERVICE_ACCOUNT) {
-      throw new Error('Missing GOOGLE_SERVICE_ACCOUNT environment variable');
-    }
-    
-    if (!CONFIG.sheet.id) {
-      throw new Error('Missing SHEET_ID environment variable');
-    }
-    
-    // Step 1: Initialize browser
-    browser = await retryOperation(
-      () => initBrowser(),
-      'Browser Init'
-    );
-    
-    // Step 2: Capture token with retry logic
-    const token = await retryOperation(
-      () => captureToken(browser),
-      'Token Capture'
-    );
-    
-    console.log('\n[Success] Token harvested successfully!');
-    console.log('[Success] Token length:', token.length, 'characters');
-    
-    // Step 3: Update Google Sheet with retry logic
-    await retryOperation(
-      () => updateSheet(token),
-      'Sheet Update'
-    );
-    
-    // Calculate execution time
-    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-    
-    console.log('\n========================================');
-    console.log('✅ EXECUTION COMPLETED SUCCESSFULLY');
-    console.log('Duration:', duration, 'seconds');
-    console.log('========================================');
     
     process.exit(0);
     
@@ -373,6 +550,11 @@ async function main() {
     console.error('Error:', error.message);
     console.error('Stack:', error.stack);
     console.error('========================================');
+    
+    if (error.message.includes('cookies') || error.message.includes('Session expired')) {
+      console.error('\n💡 SOLUTION: Run in SETUP MODE to refresh cookies');
+      console.error('Set environment variable: SETUP_MODE=true');
+    }
     
     process.exit(1);
     
