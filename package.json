@@ -1,0 +1,28 @@
+{
+  "name": "talabat-token-harvester",
+  "version": "1.0.0",
+  "description": "Automated token harvesting and synchronization system for Talabat portal using password-based authentication",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node index.js"
+  },
+  "keywords": [
+    "automation",
+    "puppeteer",
+    "token",
+    "oauth",
+    "google-sheets",
+    "talabat"
+  ],
+  "author": "Supply Chain Automation Team",
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "^21.11.0",
+    "googleapis": "^129.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}
