@@ -1,0 +1,155 @@
+name: Token Harvester - Password-Based Automation
+
+# ==================== TRIGGER CONFIGURATION ====================
+# This workflow runs automatically every hour at minute 0
+# You can also trigger it manually from the GitHub Actions tab
+
+on:
+  schedule:
+    # Runs at minute 0 of every hour (00:00, 01:00, 02:00, etc.)
+    # Format: minute hour day month day-of-week
+    # '0 * * * *' means: at minute 0, every hour, every day
+    - cron: '0 * * * *'
+  
+  # Allow manual triggering from GitHub UI
+  workflow_dispatch:
+
+# ==================== ENVIRONMENT VARIABLES ====================
+env:
+  # Node.js version to use (LTS - Long Term Support)
+  NODE_VERSION: '20.x'
+  
+  # Puppeteer configuration
+  PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'false'
+
+# ==================== PERMISSIONS ====================
+# Minimal permissions for security
+permissions:
+  contents: read
+
+# ==================== CONCURRENCY ====================
+# Only one instance runs at a time
+# Cancel any in-progress run if a new one starts
+concurrency:
+  group: token-harvester
+  cancel-in-progress: true
+
+# ==================== JOBS ====================
+jobs:
+  harvest-token:
+    # Job name that appears in GitHub Actions UI
+    name: Harvest & Sync Token
+    
+    # Use Ubuntu Linux (free GitHub-hosted runner)
+    runs-on: ubuntu-latest
+    
+    # Fail the job if it takes more than 10 minutes
+    timeout-minutes: 10
+    
+    # ==================== STEPS ====================
+    steps:
+      # STEP 1: Get the code from repository
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          # Get full git history (not needed but good practice)
+          fetch-depth: 1
+      
+      # STEP 2: Install Node.js
+      - name: 🔧 Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # Cache npm dependencies for faster runs
+          cache: 'npm'
+      
+      # STEP 3: Install required packages
+      - name: 📦 Install Dependencies
+        run: |
+          echo "Installing Puppeteer and Google APIs..."
+          npm install puppeteer googleapis
+          echo "✅ Dependencies installed successfully"
+      
+      # STEP 4: Verify environment is ready
+      - name: 🔍 Verify Environment
+        run: |
+          echo "============================================"
+          echo "Environment Information:"
+          echo "============================================"
+          echo "Node version: $(node --version)"
+          echo "NPM version: $(npm --version)"
+          echo "OS: $(uname -a)"
+          echo "Working directory: $(pwd)"
+          echo "Available memory: $(free -h | grep Mem | awk '{print $2}')"
+          echo "============================================"
+          echo "✅ Environment verified"
+      
+      # STEP 5: Run the token harvester script
+      - name: 🚀 Execute Token Harvester
+        env:
+          # Pass GitHub Secrets as environment variables
+          # These are encrypted and only accessible during workflow execution
+          PORTAL_EMAIL: ${{ secrets.PORTAL_EMAIL }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: |
+          echo "=========================================="
+          echo "Starting Token Harvester"
+          echo "=========================================="
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "Run Number: ${{ github.run_number }}"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "=========================================="
+          
+          # Run the main script
+          node index.js
+          
+          echo "=========================================="
+          echo "Token Harvester Completed"
+          echo "=========================================="
+      
+      # STEP 6: Upload logs if the job fails
+      - name: 📋 Upload Failure Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            *.log
+            screenshots/*.png
+          # Keep logs for 7 days
+          retention-days: 7
+          # Don't fail the workflow if upload fails
+          if-no-files-found: warn
+      
+      # STEP 7: Display execution summary
+      - name: 📊 Execution Summary
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "Workflow Execution Summary"
+          echo "=========================================="
+          echo "Status: ${{ job.status }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run Number: ${{ github.run_number }}"
+          echo "Run Attempt: ${{ github.run_attempt }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "=========================================="
+          
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Token harvesting completed successfully!"
+            echo "Check your Google Sheet for the updated token."
+          else
+            echo "❌ Token harvesting failed."
+            echo "Please check the logs above for error details."
+            echo "Common issues:"
+            echo "  - Incorrect credentials in GitHub Secrets"
+            echo "  - Portal website structure changed"
+            echo "  - Network timeout"
+            echo "  - Google Sheets API quota exceeded"
+          fi
+          
+          echo "=========================================="
